@@ -3,6 +3,7 @@
 
 #include <cstdint>
 #include <string>
+#include <vector>
 
 namespace louds {
 
@@ -30,8 +31,14 @@ class Trie {
   // size returns the approximate size of assigned memory.
   uint64_t size() const;
 
+  std::vector<std::string> get_all_keys() const;
+
+  static Trie* merge_trie(const Trie& trie1, const Trie& trie2);
+  static Trie* merge_trie_direct_linear(const Trie& trie1, const Trie& trie2);
+
  private:
   TrieImpl *impl_;
+
 };
 
 }  // namespace louds

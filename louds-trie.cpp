@@ -1,14 +1,15 @@
 #include "louds-trie.hpp"
 
 #ifdef _MSC_VER
- #include <intrin.h>
- #include <immintrin.h>
+  #include <intrin.h>
+  #include <immintrin.h>
 #else  // _MSC_VER
- #include <x86intrin.h>
+  #include <x86intrin.h>
 #endif  // _MSC_VER
 
 #include <cassert>
 #include <vector>
+#include <algorithm>
 
 namespace louds {
 namespace {
@@ -178,6 +179,46 @@ uint64_t Level::size() const {
   return louds.size() + outs.size() + labels.size();
 }
 
+inline void child_range(const std::vector<Level>& Lv, uint64_t lev, uint64_t node_id, uint64_t& b, uint64_t& e) {
+  b = e = 0;
+  if (lev + 1 >= Lv.size()) return;
+  const Level& ch = Lv[lev + 1];
+  if (ch.louds.n_bits == 0) return;
+
+  uint64_t start_pos = (node_id != 0) ? (ch.louds.select(node_id - 1) + 1) : 0;
+  uint64_t pos = start_pos;
+  while (pos < ch.louds.n_bits && !ch.louds.get(pos)) ++pos;  
+  uint64_t k = pos - start_pos;                                
+  b = start_pos - node_id;                                     
+  e = b + k;                                                   
+}
+
+inline bool is_terminal_at(const std::vector<Level>& Lv, uint64_t lev_plus_1, uint64_t child_id) {
+  if (lev_plus_1 >= Lv.size()) return false;
+  const Level& L = Lv[lev_plus_1];
+  return (child_id < L.outs.n_bits) && (L.outs.get(child_id) != 0);
+}
+
+inline void append_parent_one(std::vector<Level>& out_levels, uint64_t lev, bool is_first_parent_at_level) {
+  const uint64_t target = lev + 1;
+  if (out_levels.size() <= target) out_levels.resize(target + 1);
+  if (lev == 0 && is_first_parent_at_level) return;
+  out_levels[target].louds.add(1);
+}
+
+inline void emit_child(std::vector<Level>& out_levels, uint64_t lev, uint8_t label) {
+  Level& nextL = out_levels[lev + 1];
+  if (nextL.louds.n_bits == 0) {
+    nextL.louds.add(0);
+    nextL.louds.add(1);
+  } else {
+    nextL.louds.set(nextL.louds.n_bits - 1, 0);
+    nextL.louds.add(1);
+  }
+  nextL.labels.push_back(label);
+  nextL.outs.add(0);
+}
+
 }  // namespace
 
 class TrieImpl {
@@ -199,12 +240,21 @@ class TrieImpl {
     return size_;
   }
 
+  void collect_all_keys(vector<string>& keys) const;
+  const vector<Level>& get_levels() const { return levels_; }
+
  private:
   vector<Level> levels_;
   uint64_t n_keys_;
   uint64_t n_nodes_;
   uint64_t size_;
   string last_key_;
+
+  void collect_keys_recursive(vector<string>& keys, uint64_t node_id, uint64_t level, string& prefix) const;
+
+  // Friend declaration for merge functions
+  friend Trie* Trie::merge_trie(const Trie& trie1, const Trie& trie2);
+  friend Trie* Trie::merge_trie_direct_linear(const Trie& trie1, const Trie& trie2);
 };
 
 TrieImpl::TrieImpl()
@@ -222,6 +272,7 @@ void TrieImpl::add(const string &key) {
     levels_[0].outs.set(0, 1);
     ++levels_[1].offset;
     ++n_keys_;
+    last_key_ = key;
     return;
   }
   if (key.length() + 1 >= levels_.size()) {
@@ -269,7 +320,7 @@ void TrieImpl::build() {
 
 int64_t TrieImpl::lookup(const string &query) const {
   if (query.length() >= levels_.size()) {
-    return false;
+    return -1;
   }
   uint64_t node_id = 0;
   for (uint64_t i = 0; i < query.length(); ++i) {
@@ -324,7 +375,7 @@ int64_t TrieImpl::lookup(const string &query) const {
   }
   const Level &level = levels_[query.length()];
   if (!level.outs.get(node_id)) {
-    return false;
+    return -1;
   }
   return level.offset + level.outs.rank(node_id);
 }
@@ -336,7 +387,7 @@ Trie::~Trie() {
 }
 
 void Trie::add(const string &key) {
-  return impl_->add(key);
+  impl_->add(key);
 }
 
 void Trie::build() {
@@ -358,5 +409,247 @@ uint64_t Trie::n_nodes() const {
 uint64_t Trie::size() const {
   return impl_->size();
 }
+
+std::vector<std::string> Trie::get_all_keys() const {
+  std::vector<std::string> keys;
+  impl_->collect_all_keys(keys);
+  std::sort(keys.begin(), keys.end());
+  return keys;
+}
+
+void TrieImpl::collect_keys_recursive(vector<string>& keys, uint64_t node_id, uint64_t level_idx, string& prefix) const {
+  
+  if (level_idx == 0 && levels_[0].outs.get(0)) {
+    keys.push_back("");
+  }
+  
+  if (level_idx >= levels_.size()) {
+    return;
+  }
+  
+  const Level& level = levels_[level_idx];
+  
+  if (level_idx > 0 && node_id < level.outs.n_bits && level.outs.get(node_id)) {
+    keys.push_back(prefix);
+  }
+  
+  if (level_idx + 1 >= levels_.size()) {
+    return;
+  }
+  
+  const Level& child_level = levels_[level_idx + 1];
+  
+  if (child_level.louds.n_bits == 0) {
+    return;
+  }
+  
+  uint64_t child_pos;
+  
+  if (node_id != 0) {
+    if (node_id - 1 >= child_level.louds.rank(child_level.louds.n_bits)) {
+      return;
+    }
+    child_pos = child_level.louds.select(node_id - 1) + 1;
+  } else {
+    child_pos = 0;
+  }
+  
+  uint64_t child_id = child_pos - node_id;
+  
+  while (child_pos < child_level.louds.n_bits && !child_level.louds.get(child_pos)) {
+    if (child_id < child_level.labels.size()) {
+      prefix.push_back(child_level.labels[child_id]);
+      collect_keys_recursive(keys, child_id, level_idx + 1, prefix);
+      prefix.pop_back();
+    }
+    child_pos++;
+    child_id++;
+  }
+}
+
+void TrieImpl::collect_all_keys(vector<string>& keys) const {
+  string prefix;
+  collect_keys_recursive(keys, 0, 0, prefix);
+}
+
+/*
+Approach 1: Extract–Merge–Rebuild
+
+Summary
+  Pull out all keys from both tries (they come out sorted because add() enforces
+  lexicographic order), merge the two sorted lists while removing duplicates,
+  then build a new LOUDS trie by inserting the merged keys.
+
+Algorithm
+  1) collect_all_keys(trie1) and collect_all_keys(trie2) -> two sorted vectors.
+  2) Two-way merge the vectors, skipping equal neighbors (dedupe).
+  3) For each merged key: trie_out.add(key); finally call trie_out.build().
+
+Complexity (simple terms)
+  Let n1, n2 = number of keys; K1, K2 = total characters across keys in trie1, trie2;
+  Kout = total characters across merged keys; |Eout| = total edges in merged trie.
+
+  Time: O(K1 + K2 + Kout + |Eout|)
+
+  Space: O(K1 + K2 + n1 + n2 + |Eout|)
+*/
+Trie* Trie::merge_trie(const Trie& trie1, const Trie& trie2) {
+  Trie* merged = new Trie();
+  
+  vector<string> keys1, keys2;
+  trie1.impl_->collect_all_keys(keys1);
+  trie2.impl_->collect_all_keys(keys2);
+
+  assert(std::is_sorted(keys1.begin(), keys1.end()));
+  assert(std::is_sorted(keys2.begin(), keys2.end()));
+  
+  vector<string> merged_keys;
+  merged_keys.reserve(keys1.size() + keys2.size());
+  
+  size_t i = 0, j = 0;
+  while (i < keys1.size() && j < keys2.size()) {
+    if (keys1[i] < keys2[j]) {
+      merged_keys.push_back(keys1[i++]);
+    } else if (keys1[i] > keys2[j]) {
+      merged_keys.push_back(keys2[j++]);
+    } else {
+      merged_keys.push_back(keys1[i]);
+      i++;
+      j++;
+    }
+  }
+  
+  while (i < keys1.size()) {
+    merged_keys.push_back(keys1[i++]);
+  }
+  while (j < keys2.size()) {
+    merged_keys.push_back(keys2[j++]);
+  }
+  
+  for (const string& key : merged_keys) {
+    merged->add(key);
+  }
+  merged->build();
+  
+  return merged;
+}
+
+
+/*
+Approach 2 — Direct LOUDS merge (no strings) and Efficient
+
+Goal
+  Merge two tries by their LOUDS levels directly. We never build full keys.
+
+Idea:
+  - For each level (lev) while we still have parents:
+    - For each parent (from trie1 and/or trie2), find its child ranges with child_range().
+
+    - Start this parent’s child list in the OUTPUT:
+        - Put a trailing '1' at out.levels[lev+1] (append_parent_one).
+          (Leaf parents keep this '1'; if we add a child, we’ll flip it to 0.)
+
+    - Merge the two sorted child-label lists with two pointers:
+        - For each chosen label:
+            - emit_child(lev, label): flip the last 1 -> 0, then add a 1; append the label; add outs=0.
+            - If this child ends a key in either input, set outs=1 and ++offset at lev+2.
+            - Enqueue the next-level node pair for this child
+              (use the child id from a trie if it exists; if not, mark that side as absent).
+
+Complexity
+  Time: O(|E1| + |E2|) to merge + O(|Eout|) for build().
+  Space: O(|Eout|).
+*/
+Trie* Trie::merge_trie_direct_linear(const Trie& t1, const Trie& t2) {
+  Trie* out = new Trie();
+  auto& out_impl   = *out->impl_;
+  auto& out_levels = out_impl.levels_;
+  const auto& L1   = t1.impl_->get_levels();
+  const auto& L2   = t2.impl_->get_levels();
+
+  out_impl.n_keys_  = 0;
+  out_impl.n_nodes_ = 1; 
+  out_impl.size_    = 0;
+  out_levels.resize(2);
+
+  if (!L1.empty() && L1[0].outs.get(0)) { 
+    out_levels[0].outs.set(0,1); ++out_levels[1].offset; ++out_impl.n_keys_; 
+  }
+
+  if (!L2.empty() && L2[0].outs.get(0) && !out_levels[0].outs.get(0)) { 
+    out_levels[0].outs.set(0,1); ++out_levels[1].offset; ++out_impl.n_keys_; 
+  }
+
+  struct Pair { bool h1, h2; uint64_t id1, id2; };
+  std::vector<Pair> curr(1, Pair{ !L1.empty(), !L2.empty(), 0, 0 }), next;
+
+  for (uint64_t lev = 0; !curr.empty(); ++lev) {
+    if (out_levels.size() <= lev + 1) out_levels.resize(lev + 2);
+    next.clear();
+
+    for (size_t pidx = 0; pidx < curr.size(); ++pidx) {
+      const auto& p = curr[pidx];
+
+      uint64_t b1=0,e1=0, b2=0,e2=0;
+      if (p.h1) child_range(L1, lev, p.id1, b1, e1);
+      if (p.h2) child_range(L2, lev, p.id2, b2, e2);
+
+      append_parent_one(out_levels, lev, (pidx == 0));
+
+      if (b1 == e1 && b2 == e2) {
+        continue; 
+      }
+
+      while (b1 < e1 || b2 < e2) {
+        bool take1=false, take2=false;
+        uint8_t lab=0;
+
+        if (b1 < e1 && b2 < e2) {
+          uint8_t l1 = L1[lev + 1].labels[b1];
+          uint8_t l2 = L2[lev + 1].labels[b2];
+          if (l1 == l2) { 
+            lab = l1; take1 = take2 = true; 
+          }
+          else if (l1 < l2) { 
+            lab = l1; take1 = true; 
+          }
+          else { 
+            lab = l2; take2 = true; 
+          }
+        } else if (b1 < e1) { 
+          lab = L1[lev + 1].labels[b1]; take1 = true; 
+        }
+        else { 
+          lab = L2[lev + 1].labels[b2]; take2 = true; 
+        }
+
+        emit_child(out_levels, lev, lab);
+
+        bool term = (take1 && is_terminal_at(L1, lev + 1, b1))
+                 || (take2 && is_terminal_at(L2, lev + 1, b2));
+                 
+        if (term) {
+          Level& here = out_levels[lev + 1];
+          here.outs.set(here.outs.n_bits - 1, 1);
+          if (out_levels.size() <= lev + 2) out_levels.resize(lev + 3);
+          ++out_levels[lev + 2].offset;
+          ++out_impl.n_keys_;
+        }
+
+        next.push_back(Pair{ take1, take2, take1 ? b1 : 0, take2 ? b2 : 0 });
+        ++out_impl.n_nodes_;
+
+        if (take1) ++b1;
+        if (take2) ++b2;
+      }
+    }
+    curr.swap(next);  
+  }
+
+  out_impl.build();
+  return out;
+}
+
+
 
 }  // namespace louds
