@@ -35,6 +35,7 @@ class Trie {
 
   static Trie* merge_trie(const Trie& trie1, const Trie& trie2);
   static Trie* merge_trie_direct_linear(const Trie& trie1, const Trie& trie2);
+  static Trie* merge_trie_direct_linear_cuda(const Trie& t1, const Trie& t2);
 
  private:
   TrieImpl *impl_;
@@ -43,4 +44,4 @@ class Trie {
 
 }  // namespace louds
 
-#endif  // LOUDS_TRIE_HPP
+#endif 
