@@ -11,7 +11,6 @@
 #include <vector>
 #include <algorithm>
 
-
 namespace louds {
 namespace {
 
@@ -29,65 +28,6 @@ uint64_t Ctz(uint64_t x) {
 #else  // _MSC_VER
   return __builtin_ctzll(x);
 #endif  // _MSC_VER
-}
-
-static inline uint32_t Ctz32(uint32_t x) {
-    #ifdef _MSC_VER
-      return _tzcnt_u32(x);
-    #else
-      return __builtin_ctz(x);
-    #endif
-}
-    
-#if defined(__AVX2__)
-#include <immintrin.h>
-#endif
-    
-inline size_t lower_bound_u8_simd(const uint8_t* data, size_t len, uint8_t key) {
-    #if defined(__AVX2__)
-      size_t idx = 0;
-      const __m256i flip = _mm256_set1_epi8((char)0x80);        
-      const __m256i K    = _mm256_set1_epi8((char)(key ^ 0x80));
-      while (len - idx >= 32) {
-        __m256i v  = _mm256_loadu_si256((const __m256i*)(data + idx));
-        v          = _mm256_xor_si256(v, flip);
-        __m256i lt = _mm256_cmpgt_epi8(K, v); 
-        uint32_t m = (uint32_t)_mm256_movemask_epi8(lt);
-        if (m != 0xFFFFFFFFu) {
-          uint32_t not_less = ~m;
-          return idx + Ctz32(not_less);
-        }
-        idx += 32;
-      }
-      for (; idx < len; ++idx) if (data[idx] >= key) break;
-      return idx;
-    #else
-      size_t lo = 0, hi = len;
-      while (lo < hi) {
-        size_t mid = (lo + hi) / 2;
-        if (data[mid] < key) lo = mid + 1; else hi = mid;
-      }
-      return lo;
-    #endif
-}
-    
-inline int find_u8_simd(const uint8_t* data, size_t len, uint8_t key) {
-    #if defined(__AVX2__)
-      size_t idx = 0;
-      const __m256i K = _mm256_set1_epi8((char)key);
-      while (len - idx >= 32) {
-        __m256i v  = _mm256_loadu_si256((const __m256i*)(data + idx));
-        __m256i eq = _mm256_cmpeq_epi8(v, K);
-        uint32_t m = (uint32_t)_mm256_movemask_epi8(eq);
-        if (m) return (int)(idx + Ctz32(m));
-        idx += 32;
-      }
-      for (; idx < len; ++idx) if (data[idx] == key) return (int)idx;
-      return -1;
-    #else
-      for (size_t i = 0; i < len; ++i) if (data[i] == key) return (int)i;
-      return -1;
-    #endif
 }
 
 struct BitVector {
@@ -227,53 +167,31 @@ struct BitVector {
 struct Level {
   BitVector louds;
   BitVector outs;
-  struct alignas(32) AlignedLabels {
-    vector<uint8_t> data;
-    
-    uint8_t operator[](size_t i) const { return data[i]; }
-    const uint8_t* data_ptr() const { return data.data(); }
-    void push_back(uint8_t v) { data.push_back(v); }
-    size_t size() const { return data.size(); }
-  } labels;
-  
+  vector<uint8_t> labels;
   uint64_t offset;
 
   Level() : louds(), outs(), labels(), offset(0) {}
-  
+
   uint64_t size() const;
 };
 
 uint64_t Level::size() const {
-  return louds.size() + outs.size() + labels.data.size();
+  return louds.size() + outs.size() + labels.size();
 }
 
 inline void child_range(const std::vector<Level>& Lv, uint64_t lev, uint64_t node_id, uint64_t& b, uint64_t& e) {
-    b = e = 0;
-    if (lev + 1 >= Lv.size()) return;
-    const Level& ch = Lv[lev + 1];
-    if (ch.louds.n_bits == 0) return;
-  
-    uint64_t start_pos = (node_id != 0) ? (ch.louds.select(node_id - 1) + 1) : 0;
-    uint64_t pos = start_pos;
-    uint64_t end_pos = ch.louds.n_bits;
-  
-    if (pos < ch.louds.n_bits) {
-      uint64_t wid  = pos / 64;
-      uint64_t off  = pos % 64;
-      uint64_t word = ch.louds.words[wid] & (~0ULL << off);
-      while (word == 0) {
-        pos = (++wid) * 64;
-        if (pos >= ch.louds.n_bits) { end_pos = ch.louds.n_bits; break; }
-        word = ch.louds.words[wid];
-      }
-      if (pos < ch.louds.n_bits) {
-        end_pos = (wid * 64) + Ctz(word);
-      }
-    }
-    uint64_t k = end_pos - start_pos;
-    b = start_pos - node_id;
-    e = b + k;
-  }
+  b = e = 0;
+  if (lev + 1 >= Lv.size()) return;
+  const Level& ch = Lv[lev + 1];
+  if (ch.louds.n_bits == 0) return;
+
+  uint64_t start_pos = (node_id != 0) ? (ch.louds.select(node_id - 1) + 1) : 0;
+  uint64_t pos = start_pos;
+  while (pos < ch.louds.n_bits && !ch.louds.get(pos)) ++pos;  
+  uint64_t k = pos - start_pos;                                
+  b = start_pos - node_id;                                     
+  e = b + k;                                                   
+}
 
 inline bool is_terminal_at(const std::vector<Level>& Lv, uint64_t lev_plus_1, uint64_t child_id) {
   if (lev_plus_1 >= Lv.size()) return false;
@@ -364,7 +282,7 @@ void TrieImpl::add(const string &key) {
   for ( ; i < key.length(); ++i) {
     Level &level = levels_[i + 1];
     uint8_t byte = key[i];
-    if ((i == last_key_.length()) || (byte != level.labels.data.back())) {
+    if ((i == last_key_.length()) || (byte != level.labels.back())) {
       level.louds.set(levels_[i + 1].louds.n_bits - 1, 0);
       level.louds.add(1);
       level.outs.add(0);
@@ -441,26 +359,18 @@ int64_t TrieImpl::lookup(const string &query) const {
     end = begin + end - node_pos;
 
     uint8_t byte = query[i];
-    const uint8_t* base = level.labels.data_ptr();
-    uint64_t range = end - begin;
-    if (range == 0) return -1;
-    if (byte < base[begin] || byte > base[end - 1]) return -1;
-
-    if (range <= 64) { 
-      int rel = find_u8_simd(base + begin, (size_t)range, byte);
-      if (rel < 0) return -1;
-      node_id = begin + (uint64_t)rel;
-    } else {
-      uint64_t lo = begin, hi = end;
-      bool found = false;
-      while (lo < hi) {
-        uint64_t mid = (lo + hi) / 2;
-        uint8_t v = base[mid];
-        if (byte < v) hi = mid;
-        else if (byte > v) lo = mid + 1;
-        else { node_id = mid; found = true; break; }
+    while (begin < end) {
+      node_id = (begin + end) / 2;
+      if (byte < level.labels[node_id]) {
+        end = node_id;
+      } else if (byte > level.labels[node_id]) {
+        begin = node_id + 1;
+      } else {
+        break;
       }
-      if (!found) return -1;
+    }
+    if (begin >= end) {
+      return -1;
     }
   }
   const Level &level = levels_[query.length()];
@@ -626,14 +536,29 @@ Trie* Trie::merge_trie(const Trie& trie1, const Trie& trie2) {
 
 
 /*
-Approach 2 — Direct LOUDS merge with SIMD optimizations
-    - Added AVX2 SIMD fast-paths in two places while keeping the LOUDS format. 
-    - During the merge, a vectorized “byte lower_bound” scans 32 labels at a time to jump directly to the first label >= key, which cuts a lot of scalar comparisons; in lookup, a vectorized “byte find” does the same for small fan-outs. 
-    - I also made the LOUDS child scan word-parallel (skip 64 bits at once with ctz) and added a small prefetch around cross-advances. 
-    - On my runs, the SIMD benchmarks for the byte search improved from 4.04 ns/op -> 1.83 ns/op (~2.2× faster). 
-    - End-to-end Direct LOUDS merge sped up from ~19 µs -> ~16 µs (~1.2×) and in another dataset from ~16 µs -> ~9 µs (~1.8×). 
-    - Full-trie lookup also improved from ~267 ms -> ~227 ms (~1.18×). 
-    - All SIMD paths have clean scalar fallbacks, so it still compiles and passes tests on non-AVX2 machines.
+Approach 2 — Direct LOUDS merge (no strings) and Efficient
+
+Goal
+  Merge two tries by their LOUDS levels directly. We never build full keys.
+
+Idea:
+  - For each level (lev) while we still have parents:
+    - For each parent (from trie1 and/or trie2), find its child ranges with child_range().
+
+    - Start this parent’s child list in the OUTPUT:
+        - Put a trailing '1' at out.levels[lev+1] (append_parent_one).
+          (Leaf parents keep this '1'; if we add a child, we’ll flip it to 0.)
+
+    - Merge the two sorted child-label lists with two pointers:
+        - For each chosen label:
+            - emit_child(lev, label): flip the last 1 -> 0, then add a 1; append the label; add outs=0.
+            - If this child ends a key in either input, set outs=1 and ++offset at lev+2.
+            - Enqueue the next-level node pair for this child
+              (use the child id from a trie if it exists; if not, mark that side as absent).
+
+Complexity
+  Time: O(|E1| + |E2|) to merge + O(|Eout|) for build().
+  Space: O(|Eout|).
 */
 Trie* Trie::merge_trie_direct_linear(const Trie& t1, const Trie& t2) {
   Trie* out = new Trie();
@@ -675,90 +600,47 @@ Trie* Trie::merge_trie_direct_linear(const Trie& t1, const Trie& t2) {
         continue; 
       }
 
-      while (b1 < e1 && b2 < e2) {
-        uint8_t l1 = L1[lev + 1].labels.data[b1];
-        uint8_t l2 = L2[lev + 1].labels.data[b2];
-      
-        if (l1 == l2) {
-          emit_child(out_levels, lev, l1);
-          bool term = is_terminal_at(L1, lev + 1, b1) || is_terminal_at(L2, lev + 1, b2);
-          if (term) {
-            Level& here = out_levels[lev + 1];
-            here.outs.set(here.outs.n_bits - 1, 1);
-            if (out_levels.size() <= lev + 2) out_levels.resize(lev + 3);
-            ++out_levels[lev + 2].offset;
-            ++out_impl.n_keys_;
+      while (b1 < e1 || b2 < e2) {
+        bool take1=false, take2=false;
+        uint8_t lab=0;
+
+        if (b1 < e1 && b2 < e2) {
+          uint8_t l1 = L1[lev + 1].labels[b1];
+          uint8_t l2 = L2[lev + 1].labels[b2];
+          if (l1 == l2) { 
+            lab = l1; take1 = take2 = true; 
           }
-          next.push_back(Pair{true, true, b1, b2});
-          ++out_impl.n_nodes_;
-          ++b1; ++b2;
-          continue;
+          else if (l1 < l2) { 
+            lab = l1; take1 = true; 
+          }
+          else { 
+            lab = l2; take2 = true; 
+          }
+        } else if (b1 < e1) { 
+          lab = L1[lev + 1].labels[b1]; take1 = true; 
         }
-      
-        if (l1 < l2) {
-          #if defined(__AVX2__)
-            _mm_prefetch(reinterpret_cast<const char*>(&L2[lev + 1].labels.data[b2]) + 64, _MM_HINT_T0);
-          #endif
-          size_t adv = lower_bound_u8_simd(&L1[lev + 1].labels.data[b1], (size_t)(e1 - b1), l2);
-          for (size_t k = 0; k < adv; ++k) {
-            emit_child(out_levels, lev, L1[lev + 1].labels.data[b1]);
-            if (is_terminal_at(L1, lev + 1, b1)) {
-              Level& here = out_levels[lev + 1];
-              here.outs.set(here.outs.n_bits - 1, 1);
-              if (out_levels.size() <= lev + 2) out_levels.resize(lev + 3);
-              ++out_levels[lev + 2].offset;
-              ++out_impl.n_keys_;
-            }
-            next.push_back(Pair{true, false, b1, 0});
-            ++out_impl.n_nodes_;
-            ++b1;
-          }
-        } else {
-          #if defined(__AVX2__)
-            _mm_prefetch(reinterpret_cast<const char*>(&L1[lev + 1].labels.data[b1]) + 64, _MM_HINT_T0);
-          #endif
-          size_t adv = lower_bound_u8_simd(&L2[lev + 1].labels.data[b2], (size_t)(e2 - b2), l1);
-          for (size_t k = 0; k < adv; ++k) {
-            emit_child(out_levels, lev, L2[lev + 1].labels.data[b2]);
-            if (is_terminal_at(L2, lev + 1, b2)) {
-              Level& here = out_levels[lev + 1];
-              here.outs.set(here.outs.n_bits - 1, 1);
-              if (out_levels.size() <= lev + 2) out_levels.resize(lev + 3);
-              ++out_levels[lev + 2].offset;
-              ++out_impl.n_keys_;
-            }
-            next.push_back(Pair{false, true, 0, b2});
-            ++out_impl.n_nodes_;
-            ++b2;
-          }
+        else { 
+          lab = L2[lev + 1].labels[b2]; take2 = true; 
         }
-      }
-      
-      while (b1 < e1) {
-        emit_child(out_levels, lev, L1[lev + 1].labels.data[b1]);
-        if (is_terminal_at(L1, lev + 1, b1)) {
+
+        emit_child(out_levels, lev, lab);
+
+        bool term = (take1 && is_terminal_at(L1, lev + 1, b1))
+                 || (take2 && is_terminal_at(L2, lev + 1, b2));
+                 
+        if (term) {
           Level& here = out_levels[lev + 1];
           here.outs.set(here.outs.n_bits - 1, 1);
           if (out_levels.size() <= lev + 2) out_levels.resize(lev + 3);
           ++out_levels[lev + 2].offset;
           ++out_impl.n_keys_;
         }
-        next.push_back(Pair{true, false, b1, 0});
+
+        next.push_back(Pair{ take1, take2, take1 ? b1 : 0, take2 ? b2 : 0 });
         ++out_impl.n_nodes_;
-        ++b1;
-      }
-      while (b2 < e2) {
-        emit_child(out_levels, lev, L2[lev + 1].labels.data[b2]);
-        if (is_terminal_at(L2, lev + 1, b2)) {
-          Level& here = out_levels[lev + 1];
-          here.outs.set(here.outs.n_bits - 1, 1);
-          if (out_levels.size() <= lev + 2) out_levels.resize(lev + 3);
-          ++out_levels[lev + 2].offset;
-          ++out_impl.n_keys_;
-        }
-        next.push_back(Pair{false, true, 0, b2});
-        ++out_impl.n_nodes_;
-        ++b2;
+
+        if (take1) ++b1;
+        if (take2) ++b2;
       }
     }
     curr.swap(next);  
@@ -769,8 +651,5 @@ Trie* Trie::merge_trie_direct_linear(const Trie& t1, const Trie& t2) {
 }
 
 
-}  // namespace louds
 
-size_t lower_bound_u8_simd(const uint8_t* data, size_t len, uint8_t key) {
-    return louds::lower_bound_u8_simd(data, len, key);
-}
+}  // namespace louds
